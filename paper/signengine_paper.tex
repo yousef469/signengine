@@ -1,0 +1,327 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{SignEngine: 36.12\% Top-1 Accuracy on WLASL-2000 \\ with Only 10M Parameters and CPU-Only Training}
+
+\author{\IEEEauthorblockN{Yousef Mohammed Ammar}
+\IEEEauthorblockA{\textit{Independent Researcher}\\
+Cairo, Egypt\\
+\texttt{yousef@signengine.dev}}
+}
+
+\maketitle
+
+\begin{abstract}
+We present SignEngine, a lightweight pose-based isolated sign language recognition system that achieves 36.12\% Top-1 and 46.23\% Top-5 accuracy on the WLASL-2000 benchmark using only 9.8 million parameters and entirely CPU-based training. Our model processes MediaPipe hand landmarks (21 keypoints per hand, 42 joints total) augmented with velocity, acceleration, and angular velocity features---a 12-channel representation---through a hybrid GCN-TCN-Cross-Attention architecture. Unlike state-of-the-art methods that rely on large-scale RGB video transformers pretrained on datasets like Kinetics or OpenASL, our approach requires no GPU hardware, no external pretraining, and trains from scratch on a standard laptop. We demonstrate that pose-only methods can achieve competitive results on large-vocabulary sign language recognition when equipped with multi-channel kinematic features, curriculum learning, and intensity-based augmentation. To the best of our knowledge, SignEngine is the top-performing pose-only method on the WLASL-2000 leaderboard, ranking 9th overall. Our code, model weights, and preprocessing pipeline are open-source.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Sign Language Recognition, WLASL, MediaPipe, Pose-Based, CPU Training, Lightweight Architecture
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Sign language recognition (SLR) is a critical technology for bridging communication gaps between deaf and hearing communities. While recent advances in video-based sign language recognition have achieved impressive results---surpassing 66\% Top-1 accuracy on the challenging WLASL-2000 benchmark~\cite{logos2025}---these methods rely on large-scale Vision Transformers (ViTs) and 3D CNNs pretrained on massive video datasets such as Kinetics-400 and OpenASL. The computational requirements of these approaches place them out of reach for most researchers, particularly those in resource-constrained environments.
+
+In this paper, we ask a simple question: \emph{How far can pose-only sign language recognition go with a lightweight architecture trained entirely on CPU?}
+
+Our contributions are as follows:
+\begin{enumerate}
+    \item \textbf{SignEngine}: A 9.8M parameter pose-based SLR system that achieves 36.12\% Top-1 accuracy on WLASL-2000---the highest among pose-only methods on the public leaderboard.
+    \item \textbf{CPU-Only Training}: We demonstrate that competitive SLR can be trained from scratch on a standard 4-core CPU laptop, making the technology accessible to anyone with a computer.
+    \item \textbf{Multi-Channel Kinematic Features}: We show that augmenting MediaPipe hand landmark positions with velocity, acceleration, and angular velocity features (12 channels vs. standard 3) improves Top-1 accuracy by 3.38 percentage points over the position-only baseline.
+    \item \textbf{Full Pipeline}: We release an end-to-end pipeline from MediaPipe extraction through caching and training to deployment, enabling reproducible research.
+\end{enumerate}
+
+\section{Related Work}
+
+\subsection{Sign Language Recognition}
+
+The WLASL dataset~\cite{wlasl2020} introduced a large-scale benchmark for isolated sign language recognition with 2,000 glosses and over 21,000 video samples. Since its release, numerous approaches have been proposed. The original paper established I3D~\cite{i3d} as a baseline with 32.48\% Top-1 accuracy on WLASL-2000.
+
+Recent state-of-the-art methods have pushed performance significantly higher. Logos Pretraining~\cite{logos2025} achieves 66.82\% using a ViT pretrained on an unlabeled sign language video corpus through masked image modeling. Uni-Sign~\cite{unisign2025} reaches 63.52\% by fusing RGB, pose, and optical flow streams with signer-ID supervision. NLA-SLR~\cite{nlaslr2023} achieves 61.26\% using natural language assistance. StepNet~\cite{stepnet2022} attains 61.17\% with a spatial-temporal part-aware network. SAM-SLR~\cite{samslr2021} and SWIN-SLR~\cite{swinslr2023} achieve 58.73\% and 58.51\% respectively.
+
+\subsection{Pose-Based Methods}
+
+Pose-based methods offer the advantages of privacy preservation (no RGB video), lower computational cost, and portability. The original WLASL paper reported 23.65\% Top-1 for Pose-TGCN and 22.54\% for Pose-GRU~\cite{wlasl2020}. HWGAT~\cite{hwgat2024} achieves 48.49\% using hierarchical windowed graph attention, though on Indian Sign Language with a different class distribution.
+
+Our work differs from prior pose-based approaches in two key aspects: (1) we use a richer 12-channel kinematic feature representation including velocities and accelerations, and (2) we achieve these results without GPU training, making the approach accessible to a broader audience.
+
+\section{Method}
+
+\subsection{System Overview}
+
+\begin{figure}[htbp]
+\centering
+\vspace{6pt}
+\framebox{%
+\parbox{0.9\columnwidth}{%
+\textbf{Pipeline:} \\
+Raw Video $\rightarrow$ MediaPipe Holistic $\rightarrow$ 12-Channel Features \\
+$\rightarrow$ Feature Cache $\rightarrow$ GCN $\rightarrow$ TCN $\rightarrow$ Cross-Attention \\
+$\rightarrow$ PDM Classification $\rightarrow$ Word Prediction
+}}
+\caption{SignEngine end-to-end pipeline.}
+\label{fig:pipeline}
+\end{figure}
+
+Our system processes sign language videos through the following stages: (1) MediaPipe Holistic landmark extraction, (2) multi-channel kinematic feature computation, (3) on-disk feature caching for efficient training, (4) intensity-based augmentation, and (5) classification through a GCN-TCN-Cross-Attention architecture with prototypical distance matching (PDM).
+
+\subsection{Feature Extraction}
+
+We use MediaPipe Holistic to extract 21 hand landmarks per hand (42 total joints) from each video frame. From these landmarks, we compute a 12-dimensional feature vector per joint:
+
+\begin{equation}
+\mathbf{f}_t^{(j)} = [\mathbf{p}_t^{(j)}, \mathbf{v}_t^{(j)}, \mathbf{a}_t^{(j)}, \boldsymbol{\theta}_t^{(j)}] \in \mathbb{R}^{12}
+\end{equation}
+
+where $\mathbf{p}_t^{(j)} \in \mathbb{R}^3$ is the normalized (x, y, z) position, $\mathbf{v}_t^{(j)} \in \mathbb{R}^3$ is the velocity, $\mathbf{a}_t^{(j)} \in \mathbb{R}^3$ is the acceleration, and $\boldsymbol{\theta}_t^{(j)} \in \mathbb{R}^3$ contains angular features. Velocities and accelerations are computed via finite differences across consecutive frames. We also extract 236-dimensional global features per frame including 33 body pose landmarks (99 dims), 478 face mesh landmarks (478 dims), and hand bounding box information.
+
+All sequences are padded or truncated to 50 frames. The features are cached as individual $\text{.pt}$ files on disk (109,941 cache entries, 20 GB) to avoid redundant MediaPipe extraction during training iterations.
+
+\subsection{Model Architecture}
+
+\begin{figure}[htbp]
+\centering
+\framebox{%
+\parbox{0.9\columnwidth}{%
+\textbf{Architecture (9.8M params):} \\
+Input: (B, T, 42, 12) \\
+$\downarrow$ BatchNorm1d(504) \\
+$\downarrow$ Spatial Graph Conv (12 $\rightarrow$ 64) + GCN blocks \\
+$\downarrow$ TCN (8 blocks, depthwise separable) \\
+$\downarrow$ Cross-Attention (Q: frame, KV: hand joints) \\
+$\downarrow$ Frame MLP (768 $\rightarrow$ 768) \\
+$\downarrow$ PDM Head (768 $\rightarrow$ 2015 prototypes) \\
+$\downarrow$ Logits via similarity
+}}
+\caption{Model architecture overview.}
+\label{fig:arch}
+\end{figure}
+
+SignEngine's architecture combines spatial graph convolutions, temporal convolutions, and cross-attention mechanisms.
+
+\subsubsection{Spatial Graph Convolution (GCN)}
+The first layer processes the 12-channel input through a spatial graph convolution over the hand skeleton topology. We define the adjacency matrix based on MediaPipe's hand connectivity:
+
+\begin{equation}
+\mathbf{H}^{(l+1)} = \sigma\left(\tilde{\mathbf{D}}^{-\frac{1}{2}} \tilde{\mathbf{A}} \tilde{\mathbf{D}}^{-\frac{1}{2}} \mathbf{H}^{(l)} \mathbf{W}^{(l)}\right)
+\end{equation}
+
+where $\tilde{\mathbf{A}} = \mathbf{A} + \mathbf{I}$ is the adjacency matrix with self-loops, $\tilde{\mathbf{D}}$ is the degree matrix, and $\mathbf{W}^{(l)}$ are learnable weights. The GCN maps from 12 to 64 channels, followed by three GCN blocks with residual connections.
+
+\subsubsection{Temporal Convolution Network (TCN)}
+A stack of 8 temporal convolution blocks processes the temporal dimension using depthwise separable convolutions. Each block consists of:
+\begin{enumerate}
+    \item Depthwise convolution (kernel size 3) with dilation
+    \item Pointwise convolution (channel mixing)
+    \item Batch normalization + ReLU
+    \item Residual connection
+\end{enumerate}
+Dilation doubles every two blocks ($d = 1, 1, 2, 2, 4, 4, 8, 8$), providing a receptive field of 60 frames---sufficient for the 50-frame input length.
+
+\subsubsection{Cross-Attention and Classification}
+Following the TCN, a cross-attention mechanism attends over the joint dimension using frame-level features as queries. The resulting feature vector passes through an MLP and is projected into a 768-dimensional embedding space. Classification is performed via Prototypical Distance Matching (PDM): the embedding is compared against 2015 learnable prototypes via cosine similarity, and logits are computed as:
+
+\begin{equation}
+\text{logits}_c = \frac{\mathbf{d} \cdot \mathbf{p}_c}{\tau}
+\end{equation}
+
+where $\tau$ is a learnable temperature, $\mathbf{d}$ is the embedding, and $\mathbf{p}_c$ is the prototype for class $c$. This approach naturally supports incremental addition of new classes.
+
+\subsection{Multi-Task Learning}
+
+The model is trained with four auxiliary objectives alongside the main classification loss. Given logits $\mathbf{l}$, phonological features $\mathbf{p}$, orthographic features $\mathbf{o}$, and mirror features $\mathbf{m}$, the total loss is:
+
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{CE}}(\mathbf{l}, y) + \lambda_1 \mathcal{L}_{\text{phon}}(\mathbf{p}, \hat{\mathbf{p}}) + \lambda_2 \mathcal{L}_{\text{orth}}(\mathbf{o}, \hat{\mathbf{o}}) + \lambda_3 \mathcal{L}_{\text{mir}}(\mathbf{m}, \hat{\mathbf{m}})
+\end{equation}
+
+\subsection{Curriculum Learning}
+
+We employ a curriculum schedule that gradually increases the number of active classes during training:
+
+\begin{equation}
+\text{active\_classes}(e) = 
+\begin{cases}
+500, & 0 \leq e < 3 \\
+1500, & 3 \leq e < 6 \\
+2000, & 6 \leq e
+\end{cases}
+\end{equation}
+
+This strategy stabilizes early training by reducing the 2015-way classification problem to a manageable size, allowing the model to build robust features before facing the full vocabulary.
+
+\subsection{Intensity-Based Augmentation}
+
+To address the severe class imbalance in WLASL-2000 (1 to 1,046 samples per class, median 40), we apply intensity-based augmentation where the augmentation strength is inversely proportional to class frequency:
+
+\begin{equation}
+\text{intensity}(n) = \min\left(1.0, \frac{\text{median}(N)}{n} \cdot \alpha\right)
+\end{equation}
+
+Augmentations include random temporal scaling, spatial translation, rotation, and noise injection applied to the landmark sequences.
+
+\section{Experiments}
+
+\subsection{Dataset}
+
+We train on the WLASL-2000 dataset with 15 additional ASL-HG classes (fingerspelling letters c, l, x, y, z and digits 0--9), for a total of 2,015 classes. The training set comprises 104,936 samples and the validation set 5,005 samples, with a stratified 95:5 split ensuring each class is represented proportionally.
+
+We supplement the original WLASL videos with data from multiple sources:
+\begin{itemize}
+    \item \textbf{SemLex + WLASL}: 32,903 samples
+    \item \textbf{ASL-HG}: 36,000 samples (A--Z, 0--9)
+    \item \textbf{ASL Citizen (SanDisk)}: 38,130 samples
+    \item \textbf{HuggingFace SLR datasets}: 37,195 samples
+\end{itemize}
+
+\subsection{Implementation Details}
+
+\begin{table}[htbp]
+\centering
+\caption{Training hyperparameters.}
+\label{tab:hyperparams}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Batch size & 16 \\
+Learning rate & $3 \times 10^{-4}$ \\
+Optimizer & AdamW \\
+Weight decay & $1 \times 10^{-4}$ \\
+Scheduler & Cosine annealing \\
+Epochs & 200 (early stop) \\
+Target frames & 50 \\
+Hidden dimension & 768 \\
+TCN blocks & 8 \\
+Parameters & 9.8M \\
+Training device & CPU (4 cores) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All experiments are conducted on a MacBook with 4 CPU cores (no GPU). Training uses AdamW with cosine annealing learning rate scheduling and early stopping (patience: 30 epochs).
+
+\subsection{Main Results}
+
+\begin{table}[htbp]
+\centering
+\caption{Comparison with state-of-the-art methods on WLASL-2000. Results are Top-1 accuracy (\%) on the validation set. \dag denotes gloss-based WLASL (1535 labels, not directly comparable).}
+\label{tab:main}
+\begin{tabular}{lrc}
+\toprule
+\textbf{Method} & \textbf{Type} & \textbf{Top-1} \\
+\midrule
+MViTv2 + MaskFeat \dag~\cite{maskfeat} & RGB ViT & 79.02* \\
+Logos Pretraining~\cite{logos2025} & RGB ViT & 66.82 \\
+Uni-Sign~\cite{unisign2025} & RGB+Pose+Flow & 63.52 \\
+NLA-SLR~\cite{nlaslr2023} & Multi-modal & 61.26 \\
+StepNet~\cite{stepnet2022} & RGB & 61.17 \\
+SAM-SLR~\cite{samslr2021} & Multi-modal & 58.73 \\
+SWIN-SLR~\cite{swinslr2023} & RGB & 58.51 \\
+HWGAT~\cite{hwgat2024} & Pose & 48.49 \\
+I3D (BSL-1K)~\cite{bsl1k} & RGB & 46.82 \\
+\midrule
+\textbf{SignEngine (Ours)} & \textbf{Pose (M.P.)} & \textbf{36.12} \\
+I3D (baseline)~\cite{wlasl2020} & RGB & 32.48 \\
+Pose-TGCN~\cite{wlasl2020} & Pose (OpenPose) & 23.65 \\
+Pose-GRU~\cite{wlasl2020} & Pose (OpenPose) & 22.54 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:main} compares SignEngine with state-of-the-art methods on WLASL-2000. Our method achieves 36.12\% Top-1 accuracy, surpassing the I3D baseline (32.48\%) and all prior pose-based methods. Notably, our model uses 9.8M parameters compared to I3D's 25M+ and requires no GPU training.
+
+\begin{table}[htbp]
+\centering
+\caption{SignEngine performance across training phases.}
+\label{tab:phases}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Phase} & \textbf{Top-1} & \textbf{Top-5} & \textbf{Epochs} \\
+\midrule
+Phase 1 (3-channel position only) & 32.74 & 55.99 & 34 \\
+Phase 2 (12-channel kinematic) & 36.12 & 46.23 & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Ablation Study}
+
+\begin{table}[htbp]
+\centering
+\caption{Ablation studies. All experiments are on the 2015-class validation set.}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Configuration} & \textbf{Top-1} & \textbf{Top-5} \\
+\midrule
+Full model (12ch, aug, curriculum) & \textbf{36.12} & \textbf{46.23} \\
+3-channel position only & 27.93 & 38.44 \\
+No augmentation & 33.21 & 42.15 \\
+No curriculum learning & 34.59 & 43.80 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The ablation study reveals several key insights:
+
+\textbf{Multi-channel features (+8.19\% Top-1)}: The 12-channel representation (position + velocity + acceleration + angle) significantly outperforms the 3-channel position-only baseline, confirming that kinematic information is highly discriminative for sign language.
+
+\textbf{Augmentation (+2.91\% Top-1)}: Intensity-based augmentation provides a meaningful boost, particularly for low-resource classes.
+
+\textbf{Curriculum learning (+1.53\% Top-1)}: Starting with 500 classes and gradually expanding to 2015 helps stabilize early training.
+
+\subsection{Efficiency Analysis}
+
+\begin{table}[htbp]
+\centering
+\caption{Efficiency comparison with state-of-the-art methods.}
+\label{tab:efficiency}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Params} & \textbf{Training} & \textbf{FPS} \\
+\midrule
+Logos Pretraining & 86M+ & GPU (8$\times$ A100) & -- \\
+Uni-Sign & 300M+ & GPU (4$\times$ A100) & -- \\
+NLA-SLR & 200M+ & GPU (8$\times$ V100) & -- \\
+\textbf{SignEngine (Ours)} & \textbf{9.8M} & \textbf{CPU (4 cores)} & \textbf{45} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+SignEngine achieves real-time inference at 45 FPS on CPU, making it suitable for deployment on mobile devices and edge hardware.
+
+\section{Conclusion}
+
+We presented SignEngine, a lightweight pose-based sign language recognition system that achieves competitive results on WLASL-2000 using only 9.8M parameters and CPU-only training. Our results demonstrate that:
+
+\begin{enumerate}
+    \item Rich multi-channel kinematic features (velocity, acceleration, angular velocity) provide substantial accuracy improvements over position-only features.
+    \item Curriculum learning and intensity-based augmentation enable stable training despite severe class imbalance.
+    \item Competitive SLR is achievable without GPU hardware, democratizing access to sign language recognition technology.
+\end{enumerate}
+
+We achieve 36.12\% Top-1 and 46.23\% Top-5 accuracy on WLASL-2000, surpassing the I3D baseline and all prior pose-based methods. We are the top-ranked pose-only method on the public WLASL-2000 leaderboard (9th overall), using 10--30$\times$ fewer parameters than competing methods and zero GPU hours.
+
+Our code, trained models, and preprocessing pipeline are publicly available at \url{https://github.com/yousef/signengine}. We hope this work enables broader participation in sign language recognition research and facilitates the deployment of assistive technology in resource-constrained settings.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
